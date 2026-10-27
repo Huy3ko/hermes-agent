@@ -336,6 +336,7 @@ class TaskLifecycleRegistry:
                 {
                     "state": task.state,
                     "reason": task.reason,
+                    "inferred": task.inferred,
                     "refused": list(task.refused),
                 }
                 for task in tasks
