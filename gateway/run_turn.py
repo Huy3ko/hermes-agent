@@ -34,6 +34,7 @@ from gateway.session import (
     build_session_context,
 )
 from gateway.session_transcript import TranscriptReadError
+from gateway.task_lifecycle import TASK_END_MARKER, strip_task_end_marker
 from gateway.turn_context import TurnContext
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
@@ -93,6 +94,18 @@ def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     """Short single-line quote of a /bg prompt for its failure notice (the task id means nothing to the user)."""
     text = " ".join(str(prompt or "").split())
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _task_end_marker_in(agent_result: Any) -> bool:
+    """Whether the model reported "this assignment is over" (ADR-0081).
+
+    The marker is a REPORT, not content: it is removed from the user-facing
+    response by :func:`strip_task_end_marker` and only the runtime acts on it.
+    """
+    if not isinstance(agent_result, dict):
+        return False
+    text = agent_result.get("final_response") or ""
+    return isinstance(text, str) and TASK_END_MARKER in text
 
 
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
@@ -1566,6 +1579,13 @@ class GatewayTurnMixin:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
+        # The task-end marker is a report to the runtime, not content for the user
+        # (ADR-0081).  Strip it before the response is delivered -- and in EVERY
+        # branch, so the marker can never reach the user (not even in a silent or
+        # normalized response).
+        if response and TASK_END_MARKER in response:
+            response, _marker_found = strip_task_end_marker(response)
+
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
         # if the binding still points at the session this run was launched against.
         if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
@@ -2258,6 +2278,12 @@ class GatewayTurnMixin:
                 response=response, agent_failed_early=agent_failed_early,
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
+            )
+            # Task lifecycle (ADR-0081): the assignment is over when the model
+            # reported it or when the turn left no work in flight.  A turn with a
+            # running background job keeps the task open, so its result still lands.
+            self._task_close_on_turn_end(
+                session_key, marker_found=_task_end_marker_in(agent_result),
             )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
