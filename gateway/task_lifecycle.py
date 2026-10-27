@@ -63,6 +63,12 @@ class TaskLifecycle:
     task_id: str = ""
     closed_at: float = 0.0
     reason: str = ""
+    #: ``True`` when the close was INFERRED from "the turn ended and nothing was
+    #: in flight" rather than declared (marker or ``/stop``).  An inferred close
+    #: is a guess, so a result whose job already ran under this task is still
+    #: delivered -- otherwise a job that registers a moment after the turn ends
+    #: would be swallowed by a guess.
+    inferred: bool = False
     #: Refused late results, kept structured so they stay retrievable without a
     #: chat notification (ADR-0081 Anforderung 5).
     refused: list[dict[str, Any]] = field(default_factory=list)
@@ -75,7 +81,7 @@ class TaskLifecycle:
     def is_cancelled(self) -> bool:
         return self.state == TASK_CANCELLED
 
-    def close(self, state: str, *, reason: str = "") -> None:
+    def close(self, state: str, *, reason: str = "", inferred: bool = False) -> None:
         """Close this task.  Idempotent, first close wins: a later ``drained``
         must not downgrade a ``cancelled``."""
         if state not in CLOSED_TASK_STATES:
@@ -85,6 +91,9 @@ class TaskLifecycle:
         self.state = state
         self.closed_at = time.time()
         self.reason = reason or self.reason
+        # A declared close (marker, /stop) always wins over a later inferred one,
+        # but an inferred close is never downgraded into a declared one either.
+        self.inferred = inferred
 
 
 class TaskLifecycleRegistry:
@@ -95,6 +104,17 @@ class TaskLifecycleRegistry:
     was closed belongs to the closed task and is refused, even after a new user
     instruction re-armed the session with a fresh task.
     """
+
+    #: A session keeps only its recent task history.  Late results that resolve
+    #: to a trimmed task fall back to the time-based attribution and then fail
+    #: open -- bounded memory beats an unbounded leak in a long-lived gateway.
+    MAX_TASKS_PER_SESSION = 20
+    #: Refused results stay retrievable, but a pathological loop must not grow a
+    #: single task's record without bound.
+    MAX_REFUSED_PER_TASK = 50
+    #: Sessions kept in memory.  Only CLOSED sessions are evicted; an active one
+    #: is never dropped, because that would let a late result re-arm finished work.
+    MAX_SESSIONS = 500
 
     def __init__(self) -> None:
         self._by_session: dict[str, list[TaskLifecycle]] = {}
@@ -112,11 +132,47 @@ class TaskLifecycleRegistry:
         lifecycle = TaskLifecycle(
             session_key=session_key, state=TASK_ACTIVE, task_id=task_id or "",
         )
-        self._by_session.setdefault(session_key, []).append(lifecycle)
+        tasks = self._by_session.setdefault(session_key, [])
+        tasks.append(lifecycle)
+        self._trim_session(tasks)
+        self._evict_closed_sessions()
         return lifecycle
 
+    @classmethod
+    def _trim_session(cls, tasks: list[TaskLifecycle]) -> None:
+        """Keep the most recent tasks of a session, newest last.
+
+        The current (last) task is always kept: dropping it would lose the task
+        a late result has to be attributed to.
+        """
+        excess = len(tasks) - cls.MAX_TASKS_PER_SESSION
+        if excess > 0:
+            del tasks[:excess]
+
+    def _evict_closed_sessions(self, limit: Optional[int] = None) -> None:
+        """Drop the oldest sessions whose last task is closed.
+
+        An inferred close is enough here: the session is not waiting for work
+        any more, and a later user turn simply starts a fresh history.
+        """
+        limit = self.MAX_SESSIONS if limit is None else limit
+        while len(self._by_session) > limit:
+            oldest: Optional[str] = None
+            oldest_stamp = float("inf")
+            for session_key, tasks in self._by_session.items():
+                if not tasks or not tasks[-1].is_closed:
+                    continue
+                stamp = tasks[-1].closed_at or tasks[-1].started_at
+                if stamp < oldest_stamp:
+                    oldest, oldest_stamp = session_key, stamp
+            if oldest is None:
+                # Every session still has an active task: keep them all rather
+                # than evicting the state the gate depends on.
+                return
+            self._by_session.pop(oldest, None)
+
     def close(
-        self, session_key: str, state: str, *, reason: str = "",
+        self, session_key: str, state: str, *, reason: str = "", inferred: bool = False,
     ) -> Optional[TaskLifecycle]:
         """Close the current task of a session.  Returns the closed lifecycle, or
         ``None`` when there is no task to close."""
@@ -128,7 +184,7 @@ class TaskLifecycleRegistry:
             self._by_session.setdefault(session_key, []).append(lifecycle)
             tasks = self._by_session[session_key]
         lifecycle = tasks[-1]
-        lifecycle.close(state, reason=reason)
+        lifecycle.close(state, reason=reason, inferred=inferred)
         logger.info(
             "Session %s: task closed as %s (%s)",
             session_key, lifecycle.state, lifecycle.reason or "no reason",
@@ -178,7 +234,19 @@ class TaskLifecycleRegistry:
         if owner is None:
             # Not attributable: fail open rather than swallow a legitimate result.
             return True
-        return not owner.is_closed
+        if not owner.is_closed:
+            return True
+        # An INFERRED close ("the turn ended and nothing was in flight") is a
+        # guess, not a statement.  If the job demonstrably ran under this task,
+        # the guess is what was wrong -- deliver the result instead of dropping
+        # work that the runtime merely failed to see at turn end.
+        if owner.inferred and (started_at is None or started_at <= owner.closed_at):
+            logger.info(
+                "Delivering a late result for session %s: the task was closed by inference, "
+                "and the job started under it.", session_key,
+            )
+            return True
+        return False
 
     @staticmethod
     def _owner_of(
@@ -219,17 +287,32 @@ class TaskLifecycleRegistry:
         return owner
 
     def record_refusal(
-        self, session_key: str, *, reason: str = "", detail: Optional[dict[str, Any]] = None,
+        self,
+        session_key: str,
+        *,
+        reason: str = "",
+        detail: Optional[dict[str, Any]] = None,
+        task_id: Optional[str] = None,
+        started_at: Optional[float] = None,
     ) -> None:
         """Record a refused late result so it stays retrievable without a chat
-        notification (ADR-0081 Anforderung 5)."""
+        notification (ADR-0081 Anforderung 5).
+
+        The entry is filed on the task that OWNS the result, not on whichever
+        task is current: after a re-arm the two differ, and a record pointing at
+        the wrong task is worse than no record.
+        """
         tasks = self._by_session.setdefault(session_key, [])
         if not tasks:
             tasks.append(TaskLifecycle(session_key=session_key, state=TASK_ACTIVE))
+        owner = self._owner_of(tasks, started_at=started_at, task_id=task_id) or tasks[-1]
         entry: dict[str, Any] = {"reason": reason or "task closed", "at": time.time()}
         if detail:
             entry.update(detail)
-        tasks[-1].refused.append(entry)
+        owner.refused.append(entry)
+        excess = len(owner.refused) - self.MAX_REFUSED_PER_TASK
+        if excess > 0:
+            del owner.refused[:excess]
         logger.info(
             "Refused late background result for session %s: %s", session_key, entry["reason"],
         )
@@ -331,8 +414,11 @@ def close_finished_task(
             session_key, TASK_DRAINED, reason=reason or "model reported task end",
         )
     if not has_live_work:
+        # Inferred, not declared: the turn ended and we SAW nothing in flight.
+        # A job that registers a moment later is still legitimate work.
         return task_lifecycles.close(
             session_key, TASK_DRAINED, reason=reason or "turn ended without pending work",
+            inferred=True,
         )
     return None
 
@@ -371,6 +457,10 @@ class GatewayTaskLifecycleMixin:
         task_lifecycles.record_refusal(
             session_key,
             reason="task closed before the result arrived",
+            # Attribute the record to the task that owns the result, not to
+            # whatever task happens to be current after a re-arm.
+            task_id=owner_task_id or None,
+            started_at=started_at,
             detail={
                 "process_id": evt.get("session_id"),
                 "owner_task_id": evt.get("owner_task_id"),
